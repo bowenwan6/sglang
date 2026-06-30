@@ -200,10 +200,14 @@ class CUDAPiecewiseBackend:
 
             # During normal capture (PiecewiseCudaGraphRunner.capture()),
             # set_pcg_capture_stream() guarantees a valid stream. However,
-            # Dynamo may silently recompile on HIP/MLA serving batches whose
-            # token count exceeds the captured range. The replacement backend
-            # has no capture stream; fall back there instead of crashing while
-            # preserving the original assertion on other platforms.
+            # Dynamo may silently recompile (e.g. multimodal models'
+            # forward when input_deepstack_embeds toggles from None to a
+            # tensor on the first image request, or HIP/MLA batches
+            # whose token count exceeds the captured range). The
+            # replacement backend has no capture stream; fall back to
+            # the inductor-compiled general-shape graph instead of
+            # crashing. Pre-existed for HIP; extended to CUDA so the
+            # assertion can no longer be reached at inference time.
             stream = get_pcg_capture_stream()
             if _DEBUG_PCG_CALL_TRACE:
                 _pcg_dbg(
@@ -212,24 +216,13 @@ class CUDAPiecewiseBackend:
                     f"about to capture; stream={'set' if stream is not None else 'None'} "
                     f"_is_hip={_is_hip}"
                 )
-            if _is_hip and stream is None:
+            if stream is None:
                 print_warning_once(
                     "PCG capture stream is not set; likely a Dynamo runtime "
                     "recompilation. Falling back to eager execution for this "
                     "subgraph."
                 )
                 return entry.runnable(*args)
-            if stream is None and _DEBUG_PCG_CALL_TRACE:
-                _pcg_dbg(
-                    f"ASSERTION ABOUT TO FIRE id={id(self):#x} "
-                    f"layer_idx={self.piecewise_compile_index} "
-                    f"runtime_shape={runtime_shape} "
-                    f"entry.compiled={entry.compiled} "
-                    f"entry.num_finished_warmup={entry.num_finished_warmup}"
-                )
-            assert (
-                stream is not None
-            ), "PCG capture stream is not set, please check if runtime recompilation happened"
 
             if self.compile_config.get_enable_debug_mode():
                 input_addresses = [
