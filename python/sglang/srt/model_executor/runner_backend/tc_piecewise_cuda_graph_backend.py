@@ -195,38 +195,6 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
                                     f"Compiling num tokens ({num_tokens=})"
                                 )
                             cuda_graph_runner._run_dummy_forward(num_tokens=num_tokens)
-                        # Multimodal warmup hook: opt-in per model.
-                        # Models that override
-                        # `pcg_warmup_multimodal_branch(input_ids, positions, fb)`
-                        # get a second forward pass per shape with the
-                        # `input_deepstack_embeds != None` Dynamo branch
-                        # exercised, so the piecewise CUDA graph backend can
-                        # later capture cudagraphs for it. Prototype for
-                        # debug/v2-imgA-pcg-capture-stream-fix (Y) shape.
-                        mm_warmup = getattr(
-                            getattr(self, "_model_runner_model", None)
-                            or getattr(cuda_graph_runner.model_runner, "model", None),
-                            "pcg_warmup_multimodal_branch",
-                            None,
-                        )
-                        if mm_warmup is not None:
-                            mm_range = (
-                                tqdm.tqdm(
-                                    list(reversed(cuda_graph_runner.capture_num_tokens))
-                                )
-                                if get_tensor_model_parallel_rank() == 0
-                                else reversed(cuda_graph_runner.capture_num_tokens)
-                            )
-                            for num_tokens in mm_range:
-                                if get_tensor_model_parallel_rank() == 0:
-                                    mm_range.set_description(
-                                        f"Compiling MM num tokens ({num_tokens=})"
-                                    )
-                                fb, attn_backend = cuda_graph_runner.capture_prepare(
-                                    num_tokens
-                                )
-                                attn_backend.init_forward_metadata(fb)
-                                mm_warmup(fb.input_ids, fb.positions, fb)
             finally:
                 _toggle_multi_platform_ops(
                     language_model.model, reverse=True, num_tokens=16
