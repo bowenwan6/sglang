@@ -1313,6 +1313,59 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         input_deepstack_embeds = embedding[:, separate_index:]
         return input_embeds, input_deepstack_embeds
 
+    def pcg_warmup_multimodal_branch(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        """PCG warmup hook for the multimodal (input_deepstack_embeds != None)
+        Dynamo branch.
+
+        The default warmup driver builds a ForwardBatch with no mm_inputs;
+        general_mm_embed_routine therefore never passes
+        input_deepstack_embeds=tensor down to Qwen3LLMModel.forward. Dynamo
+        captures every piecewise CUDA graph for the input_deepstack_embeds=None
+        branch only. The first real image request fails the
+        'input_deepstack_embeds is None' guard and triggers a runtime
+        recompile whose new CUDAPiecewiseBackend instances never get a
+        capture stream attached.
+
+        This hook synthesizes a zero-valued input_deepstack_embeds tensor at
+        the expected shape and calls self.model.forward directly. Invoked
+        from TcPiecewiseCudaGraphBackend._run_compile_pass alongside the
+        existing text-branch warmup, it makes Dynamo trace and
+        torch.compile the multimodal branch as well, so the piecewise CUDA
+        graph backend can later capture cudagraphs for it during the
+        capture phase. Result: no Dynamo recompile on the first image
+        request, no missing-capture-stream fallback at inference.
+
+        Prototype for the (Y) shape in the
+        debug/v2-imgA-pcg-capture-stream-fix profiler sub-track.
+        """
+        if self.is_mrope_enabled:
+            positions = forward_batch.mrope_positions
+
+        embed_tokens = self.model.embed_tokens
+        input_embeds = embed_tokens(input_ids)
+
+        num_tokens = input_embeds.shape[0]
+        hidden_size = self.config.hidden_size
+        input_deepstack_embeds = torch.zeros(
+            num_tokens,
+            hidden_size * self.num_deepstack_embeddings,
+            dtype=input_embeds.dtype,
+            device=input_embeds.device,
+        )
+
+        return self.model(
+            input_ids=input_ids,
+            positions=positions,
+            forward_batch=forward_batch,
+            input_embeds=input_embeds,
+            input_deepstack_embeds=input_deepstack_embeds,
+        )
+
     @property
     def start_layer(self) -> int:
         return getattr(getattr(self, "model", None), "start_layer", 0)
