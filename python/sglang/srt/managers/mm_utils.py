@@ -69,6 +69,51 @@ def force_warmup_deepstack_embeds():
     finally:
         _force_warmup_deepstack_tls.active = prev
 
+
+def _get_or_alloc_pcg_deepstack_buffer(
+    multimodal_model: Any,
+    num_tokens: int,
+    hidden_size: int,
+    num_deepstack_embeddings: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Lazy-allocate (or grow) a static `input_deepstack_embeds` buffer on
+    ``multimodal_model``, then return a slice sized to ``num_tokens``.
+
+    Why this exists: PCG captures cuda graphs that read from
+    ``input_deepstack_embeds`` at the address it had during the warmup
+    capture call. If warmup and runtime each fresh-allocate a tensor at
+    that name, the captured graph at replay reads from a stale
+    (warmup-time) address and downstream RMSNorms run on garbage values.
+    The buffer guarantees the same address is used at both phases, so
+    replay reads valid data; runtime callers copy real deepstack values
+    into the slice before calling the language model forward.
+
+    Grow policy: allocate ``max(num_tokens, 8192)`` rows on first use
+    (matches typical PCG capture_num_tokens upper bound); on the rare
+    case of a request exceeding the buffer, reallocate at ``num_tokens``.
+    Both warmup and runtime callers must use the slice returned here,
+    not their own allocations.
+    """
+    width = hidden_size * num_deepstack_embeddings
+    max_tokens = getattr(multimodal_model, "_pcg_deepstack_buffer_max_tokens", None)
+    buf = getattr(multimodal_model, "_pcg_deepstack_buffer", None)
+    needs_alloc = (
+        buf is None
+        or max_tokens is None
+        or num_tokens > max_tokens
+        or buf.shape[1] != width
+        or buf.dtype != dtype
+        or buf.device != device
+    )
+    if needs_alloc:
+        rows = max(num_tokens, 8192)
+        buf = torch.zeros(rows, width, dtype=dtype, device=device)
+        multimodal_model._pcg_deepstack_buffer = buf
+        multimodal_model._pcg_deepstack_buffer_max_tokens = rows
+    return buf[:num_tokens]
+
 # NOTE: Using the shared logger from sglang.utils instead of creating a module-specific logger
 # to ensure consistent logging behavior across the codebase. This prevents issues with log
 # propagation that can cause some log messages (like 'server is fired up') to not appear
@@ -1133,7 +1178,37 @@ def general_mm_embed_routine(
 
             # add for qwen3_vl deepstack
             if use_deepstack:
-                kwargs["input_deepstack_embeds"] = other_info["input_deepstack_embeds"]
+                # Route through a stable, model-attached buffer so the
+                # address that the captured cuda graphs reference at
+                # warmup time matches the address at inference. Without
+                # this, embed_mm_inputs's freshly allocated tensor sits
+                # at a different data_ptr each call and the captured
+                # graph replays against stale memory (silent corruption
+                # for layers in the deepstack range).
+                _real = other_info["input_deepstack_embeds"]
+                hidden_size = getattr(
+                    getattr(multimodal_model, "config", None), "hidden_size", None
+                )
+                num_deepstack_embeddings = getattr(
+                    multimodal_model, "num_deepstack_embeddings", None
+                )
+                if (
+                    hidden_size is not None
+                    and num_deepstack_embeddings is not None
+                    and num_deepstack_embeddings > 0
+                ):
+                    _slot = _get_or_alloc_pcg_deepstack_buffer(
+                        multimodal_model,
+                        _real.shape[0],
+                        hidden_size,
+                        num_deepstack_embeddings,
+                        dtype=_real.dtype,
+                        device=_real.device,
+                    )
+                    _slot.copy_(_real)
+                    kwargs["input_deepstack_embeds"] = _slot
+                else:
+                    kwargs["input_deepstack_embeds"] = _real
             # Offload GPU features to CPU instead of discarding them to balance memory
             # efficiency and data persistence.
             # In chunked-prefill, a request is processed across multiple batches, and
@@ -1166,14 +1241,12 @@ def general_mm_embed_routine(
             forward_batch.mm_input_embeds = input_embeds
         elif _is_force_warmup_deepstack_active() and use_deepstack:
             # PCG warmup-only branch (see force_warmup_deepstack_embeds).
-            # Synthesize a zero-valued input_deepstack_embeds at the same
-            # [num_tokens, hidden_size * num_deepstack_embeddings] shape the
-            # real mm path produces so Dynamo compiles the
-            # `input_deepstack_embeds != None` specialization of
-            # language_model.forward. Without this branch, every PCG warmup
-            # pass sees `input_deepstack_embeds=None` and the first real
-            # image request at inference forces a runtime recompile whose
-            # new CUDAPiecewiseBackend instances have no capture stream.
+            # Use the model-attached static deepstack buffer (the same
+            # one the real-mm path copies into at inference) so the
+            # captured cuda graph and the runtime replay reference the
+            # same address. Without this stable address, downstream
+            # RMSNorms read stale (warmup) memory at replay and produce
+            # silently corrupted outputs.
             input_embeds = embed_tokens(input_ids)
             hidden_size = getattr(
                 getattr(multimodal_model, "config", None), "hidden_size", None
@@ -1186,12 +1259,19 @@ def general_mm_embed_routine(
                 and num_deepstack_embeddings is not None
                 and num_deepstack_embeddings > 0
             ):
-                kwargs["input_deepstack_embeds"] = torch.zeros(
+                _slot = _get_or_alloc_pcg_deepstack_buffer(
+                    multimodal_model,
                     input_embeds.shape[0],
-                    hidden_size * num_deepstack_embeddings,
+                    hidden_size,
+                    num_deepstack_embeddings,
                     dtype=input_embeds.dtype,
                     device=input_embeds.device,
                 )
+                # Warmup feeds zeros; the slice was zero-initialized at
+                # buffer allocation. Re-zero to be safe in case a prior
+                # real-mm copy left values from inference.
+                _slot.zero_()
+                kwargs["input_deepstack_embeds"] = _slot
         else:
             input_embeds = embed_tokens(input_ids)
         # Copy to pre-allocated buffer if available (for CUDA graph address stability)
