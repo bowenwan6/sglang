@@ -684,6 +684,49 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 )
             self.capture_one_shape(num_tokens)
 
+        # Multimodal capture pass: backends that compiled the
+        # input_deepstack_embeds != None branch during their compile-pass
+        # (TcPiecewise driving general_mm_embed_routine inside
+        # force_warmup_deepstack_embeds()) must also capture that frame's
+        # CUDAPiecewiseBackend cuda graphs here, otherwise the first real
+        # image request still trips the missing-capture-stream path. Gated
+        # by `backend.wants_mm_warmup_capture` (only TcPiecewise opts in)
+        # and by the language model exposing `use_deepstack` truthy
+        # (general_mm_embed_routine's synthesis branch checks the same).
+        if (
+            getattr(self.backend, "wants_mm_warmup_capture", False)
+            and self._has_deepstack_branches()
+        ):
+            from sglang.srt.managers.mm_utils import force_warmup_deepstack_embeds
+
+            mm_capture_range = (
+                tqdm.tqdm(list(reversed(self.capture_num_tokens)))
+                if get_tensor_model_parallel_rank() == 0
+                else reversed(self.capture_num_tokens)
+            )
+            with force_warmup_deepstack_embeds():
+                for num_tokens in mm_capture_range:
+                    if get_tensor_model_parallel_rank() == 0:
+                        avail_mem = get_available_gpu_memory(
+                            self.model_runner.device,
+                            self.model_runner.gpu_id,
+                            empty_cache=False,
+                        )
+                        mm_capture_range.set_description(
+                            f"Capturing MM num tokens ({num_tokens=} {avail_mem=:.2f} GB)"
+                        )
+                    self.capture_one_shape(num_tokens)
+
+    def _has_deepstack_branches(self) -> bool:
+        """True if `model_runner.model.use_deepstack` is a non-empty mapping
+        with at least one truthy value. Mirrors the gate used in
+        TcPiecewiseCudaGraphBackend._model_has_deepstack so the two driver
+        sites (compile pass + capture pass) stay aligned."""
+        use_deepstack = getattr(self.model_runner.model, "use_deepstack", None)
+        if not use_deepstack:
+            return False
+        return any(bool(v) for v in use_deepstack.values())
+
     def capture_one_shape(self, size: int) -> None:
         """Per-shape capture: build dummy ForwardBatch + run_once,
         delegate to backend. size is the prefill token count.

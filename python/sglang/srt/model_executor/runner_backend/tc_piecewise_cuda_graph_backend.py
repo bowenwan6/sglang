@@ -84,6 +84,13 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
     recomputed at replay outside the compiled callable's sub-graphs.
     """
 
+    # Opts this backend into the runner's per-shape multimodal capture
+    # loop (see PrefillCudaGraphRunner._capture_one_stream). Only meaningful
+    # for models whose `use_deepstack` is truthy; the runner gates on that
+    # separately. Other prefill backends (Breakable etc.) don't drive
+    # PCG / Dynamo and don't need this.
+    wants_mm_warmup_capture: bool = True
+
     def __init__(self, cuda_graph_runner: BaseCudaGraphRunner) -> None:
         model_runner = cuda_graph_runner.model_runner
         self._pool = None
