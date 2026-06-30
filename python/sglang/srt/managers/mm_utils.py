@@ -2,9 +2,11 @@
 Multi-modality utils
 """
 
+import contextlib
 import copy
 import hashlib
 import pickle
+import threading
 from abc import abstractmethod
 from collections import defaultdict
 from multiprocessing import shared_memory
@@ -31,6 +33,41 @@ from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 from sglang.utils import logger
 
 _is_npu = is_npu()
+
+# Thread-local "force-multimodal-warmup" gate.
+#
+# Read by general_mm_embed_routine. When set AND `use_deepstack` is truthy for
+# the active modality, the routine synthesizes a zero-valued
+# `input_deepstack_embeds` tensor instead of requiring real mm_inputs on the
+# forward_batch. Lets the PCG warmup driver compile the
+# `input_deepstack_embeds != None` Dynamo branch of the language model's
+# forward during torch.compile warmup, without bypassing
+# `set_attention_metadata_context()` (which is what broke the R4.C naive
+# prototype on the profiler debug branch).
+#
+# Production behavior is unchanged when the gate is off (the default).
+_force_warmup_deepstack_tls = threading.local()
+
+
+def _is_force_warmup_deepstack_active() -> bool:
+    return getattr(_force_warmup_deepstack_tls, "active", False)
+
+
+@contextlib.contextmanager
+def force_warmup_deepstack_embeds():
+    """Context manager that signals general_mm_embed_routine to synthesize
+    a zero `input_deepstack_embeds` for the duration of the block.
+
+    Intended for PCG warmup so the multimodal Dynamo branch is compiled
+    alongside the text-only branch. No-op for models whose
+    `use_deepstack` mapping is empty.
+    """
+    prev = getattr(_force_warmup_deepstack_tls, "active", False)
+    _force_warmup_deepstack_tls.active = True
+    try:
+        yield
+    finally:
+        _force_warmup_deepstack_tls.active = prev
 
 # NOTE: Using the shared logger from sglang.utils instead of creating a module-specific logger
 # to ensure consistent logging behavior across the codebase. This prevents issues with log
@@ -1127,6 +1164,34 @@ def general_mm_embed_routine(
                                     )
             forward_batch.mm_inputs = None
             forward_batch.mm_input_embeds = input_embeds
+        elif _is_force_warmup_deepstack_active() and use_deepstack:
+            # PCG warmup-only branch (see force_warmup_deepstack_embeds).
+            # Synthesize a zero-valued input_deepstack_embeds at the same
+            # [num_tokens, hidden_size * num_deepstack_embeddings] shape the
+            # real mm path produces so Dynamo compiles the
+            # `input_deepstack_embeds != None` specialization of
+            # language_model.forward. Without this branch, every PCG warmup
+            # pass sees `input_deepstack_embeds=None` and the first real
+            # image request at inference forces a runtime recompile whose
+            # new CUDAPiecewiseBackend instances have no capture stream.
+            input_embeds = embed_tokens(input_ids)
+            hidden_size = getattr(
+                getattr(multimodal_model, "config", None), "hidden_size", None
+            )
+            num_deepstack_embeddings = getattr(
+                multimodal_model, "num_deepstack_embeddings", None
+            )
+            if (
+                hidden_size is not None
+                and num_deepstack_embeddings is not None
+                and num_deepstack_embeddings > 0
+            ):
+                kwargs["input_deepstack_embeds"] = torch.zeros(
+                    input_embeds.shape[0],
+                    hidden_size * num_deepstack_embeddings,
+                    dtype=input_embeds.dtype,
+                    device=input_embeds.device,
+                )
         else:
             input_embeds = embed_tokens(input_ids)
         # Copy to pre-allocated buffer if available (for CUDA graph address stability)
