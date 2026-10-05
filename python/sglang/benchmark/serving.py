@@ -255,6 +255,20 @@ def _extract_cache_from_sglext(data, output):
         output.cached_tokens_details = details
 
 
+def _stream_error(data: Dict[str, Any]) -> Optional[str]:
+    # A server that fails a request after sending the 200 header (a waiting
+    # timeout, an abort) reports it inside the stream, not as an HTTP status.
+    error = data.get("error")
+    if error:
+        return (
+            str(error.get("message", error)) if isinstance(error, dict) else str(error)
+        )
+    finish_reason = (data.get("meta_info") or {}).get("finish_reason")
+    if isinstance(finish_reason, dict) and finish_reason.get("type") == "abort":
+        return str(finish_reason.get("message") or "aborted by the server")
+    return None
+
+
 def _record_server_prompt_len(data, output):
     """Take the prompt length from the server, the only side that knows it.
 
@@ -341,6 +355,7 @@ async def async_request_openai_completions(
                 url=api_url, json=payload, headers=headers
             ) as response:
                 if response.status == 200:
+                    stream_error = None
                     async for chunk_bytes in response.content:
                         chunk_bytes = chunk_bytes.strip()
                         if not chunk_bytes:
@@ -352,6 +367,9 @@ async def async_request_openai_completions(
                             pass
                         else:
                             data = json.loads(chunk)
+                            stream_error = _stream_error(data)
+                            if stream_error is not None:
+                                break
                             _record_server_prompt_len(data, output)
 
                             if getattr(args, "cache_report", False):
@@ -380,10 +398,13 @@ async def async_request_openai_completions(
                                     "completion_tokens", output_len
                                 )
 
-                    output.generated_text = generated_text
-                    output.success = True
-                    output.latency = latency
-                    output.output_len = output_len
+                    if stream_error is None:
+                        output.generated_text = generated_text
+                        output.success = True
+                        output.latency = latency
+                        output.output_len = output_len
+                    else:
+                        output.error = stream_error
                 else:
                     output.error = (
                         (response.reason or "") + ": " + (await response.text())
@@ -528,6 +549,7 @@ async def async_request_openai_chat_completions(
                             _extract_cache_from_sglext(response_json, output)
                     else:
                         # Streaming response
+                        stream_error = None
                         async for chunk_bytes in response.content:
                             chunk_bytes = chunk_bytes.strip()
                             if not chunk_bytes:
@@ -539,6 +561,9 @@ async def async_request_openai_chat_completions(
                                 pass
                             else:
                                 data = json.loads(chunk)
+                                stream_error = _stream_error(data)
+                                if stream_error is not None:
+                                    break
                                 # Check for usage info in final chunks. OpenAI-compatible
                                 # servers may emit usage-only chunks with choices=[].
                                 output_len = (data.get("usage") or {}).get(
@@ -575,10 +600,13 @@ async def async_request_openai_chat_completions(
                                     most_recent_timestamp = timestamp
                                     generated_text += content
 
-                        output.generated_text = generated_text
-                        output.success = True
-                        output.latency = latency
-                        output.output_len = output_len
+                        if stream_error is None:
+                            output.generated_text = generated_text
+                            output.success = True
+                            output.latency = latency
+                            output.output_len = output_len
+                        else:
+                            output.error = stream_error
                 else:
                     output.error = (
                         (response.reason or "") + ": " + (await response.text())
@@ -735,6 +763,7 @@ async def async_request_sglang_generate(
                 url=api_url, json=payload, headers=headers
             ) as response:
                 if response.status == 200:
+                    stream_error = None
                     async for chunk_bytes in response.content:
                         chunk_bytes = chunk_bytes.strip()
                         if not chunk_bytes:
@@ -752,6 +781,9 @@ async def async_request_sglang_generate(
                             pass
                         else:
                             data = orjson.loads(sse_data)
+                            stream_error = _stream_error(data)
+                            if stream_error is not None:
+                                break
 
                             _meta_info = data.get("meta_info") or {}
                             if _meta_info.get("spec_accept_length") is not None:
@@ -793,10 +825,13 @@ async def async_request_sglang_generate(
                                 most_recent_timestamp = timestamp
                                 last_output_len = output_len
 
-                    output.generated_text = generated_text
-                    output.success = True
-                    output.latency = latency
-                    output.output_len = output_len
+                    if stream_error is None:
+                        output.generated_text = generated_text
+                        output.success = True
+                        output.latency = latency
+                        output.output_len = output_len
+                    else:
+                        output.error = stream_error
                 else:
                     output.error = (
                         (response.reason or "") + ": " + (await response.text())
