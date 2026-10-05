@@ -1082,6 +1082,98 @@ class BenchmarkMetrics:
     max_output_tokens_per_s: float = 0.0
     max_concurrent_requests: int = 0
 
+    # Goodput (set only when SLOs are given via --goodput)
+    request_goodput: Optional[float] = None
+    slo_attainment: Optional[float] = None
+    slo_attainment_by_metric: Optional[Dict[str, float]] = None
+
+
+GOODPUT_SLO_METRICS = ("ttft", "tpot", "e2el")
+
+
+def parse_goodput_slos(slo_pairs: Optional[List[str]]) -> Optional[Dict[str, float]]:
+    """Parse --goodput KEY:VALUE pairs into {metric: SLO in milliseconds}."""
+    if not slo_pairs:
+        return None
+    slos: Dict[str, float] = {}
+    for pair in slo_pairs:
+        name, sep, value = pair.partition(":")
+        if not sep or name not in GOODPUT_SLO_METRICS:
+            raise ValueError(
+                f"Invalid --goodput entry {pair!r}: expected KEY:VALUE with KEY in "
+                f"{', '.join(GOODPUT_SLO_METRICS)}."
+            )
+        if name in slos:
+            raise ValueError(f"Duplicate --goodput metric {name!r}.")
+        try:
+            slo_ms = float(value)
+        except ValueError:
+            raise ValueError(
+                f"Invalid --goodput value in {pair!r}: expected milliseconds."
+            ) from None
+        if not math.isfinite(slo_ms) or slo_ms <= 0:
+            raise ValueError(
+                f"Invalid --goodput value in {pair!r}: must be a positive number."
+            )
+        slos[name] = slo_ms
+    return slos
+
+
+def _request_slo_results(
+    output: RequestFuncOutput, goodput_slos: Dict[str, float]
+) -> Dict[str, bool]:
+    if not output.success:
+        return {name: False for name in goodput_slos}
+    # A single-token response has no inter-token interval, so its TPOT is 0.
+    tpot_s = (
+        (output.latency - output.ttft) / (output.output_len - 1)
+        if output.output_len > 1
+        else 0.0
+    )
+    observed_ms = {
+        "ttft": output.ttft * 1000,
+        "tpot": tpot_s * 1000,
+        "e2el": output.latency * 1000,
+    }
+    return {name: observed_ms[name] <= slo for name, slo in goodput_slos.items()}
+
+
+def _goodput_result_fields(
+    goodput_slos: Optional[Dict[str, float]], metrics: BenchmarkMetrics
+) -> Dict[str, Any]:
+    if not goodput_slos:
+        return {}
+    return {
+        "goodput_slos_ms": goodput_slos,
+        "request_goodput": metrics.request_goodput,
+        "slo_attainment": metrics.slo_attainment,
+        "slo_attainment_by_metric": metrics.slo_attainment_by_metric,
+    }
+
+
+def _print_goodput_metrics(
+    goodput_slos: Dict[str, float], metrics: BenchmarkMetrics
+) -> None:
+    print("{s:{c}^{n}}".format(s="Goodput", n=50, c="-"))
+    print(
+        "{:<40} {:<10}".format(
+            "SLOs (ms):",
+            " ".join(f"{name}:{slo:g}" for name, slo in goodput_slos.items()),
+        )
+    )
+    print(
+        "{:<40} {:<10.2f}".format("Request goodput (req/s):", metrics.request_goodput)
+    )
+    print(
+        "{:<40} {:<10.2f}".format("SLO attainment (%):", metrics.slo_attainment * 100)
+    )
+    for name, attainment in metrics.slo_attainment_by_metric.items():
+        print(
+            "{:<40} {:<10.2f}".format(
+                f"{name.upper()} SLO attainment (%):", attainment * 100
+            )
+        )
+
 
 async def get_request(
     input_requests: List[DatasetRow],
@@ -1131,6 +1223,7 @@ def calculate_metrics(
     backend: str,
     accept_length: Optional[float] = None,
     plot_throughput: bool = False,
+    goodput_slos: Optional[Dict[str, float]] = None,
 ) -> Tuple[BenchmarkMetrics, List[int]]:
     output_lens: List[int] = []
     retokenized_output_lens: List[int] = []
@@ -1255,6 +1348,20 @@ def calculate_metrics(
             else:
                 print("tip: install termplotlib and gnuplot to plot the metrics")
 
+    request_goodput = None
+    slo_attainment = None
+    slo_attainment_by_metric = None
+    if goodput_slos:
+        slo_results = [_request_slo_results(output, goodput_slos) for output in outputs]
+        num_requests = max(len(outputs), 1)
+        num_good = sum(all(result.values()) for result in slo_results)
+        request_goodput = num_good / dur_s
+        slo_attainment = num_good / num_requests
+        slo_attainment_by_metric = {
+            name: sum(result[name] for result in slo_results) / num_requests
+            for name in goodput_slos
+        }
+
     itls = retokenized_itls if use_retokenized_itl else itls
     metrics = BenchmarkMetrics(
         completed=completed,
@@ -1299,6 +1406,9 @@ def calculate_metrics(
         concurrency=np.sum(e2e_latencies) / dur_s,
         max_output_tokens_per_s=max_output_tokens_per_s,
         max_concurrent_requests=max_concurrent_requests,
+        request_goodput=request_goodput,
+        slo_attainment=slo_attainment,
+        slo_attainment_by_metric=slo_attainment_by_metric,
     )
 
     return metrics, output_lens
@@ -1398,6 +1508,7 @@ async def benchmark(
     mooncake_num_rounds=1,
     profile_prefill_url: Optional[List[str]] = None,
     profile_decode_url: Optional[List[str]] = None,
+    goodput_slos: Optional[Dict[str, float]] = None,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -1665,6 +1776,7 @@ async def benchmark(
         backend=backend,
         accept_length=accept_length,
         plot_throughput=args.plot_throughput,
+        goodput_slos=goodput_slos,
     )
 
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
@@ -1735,6 +1847,8 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("Concurrency:", metrics.concurrency))
     if accept_length:
         print("{:<40} {:<10.2f}".format("Accept length:", accept_length))
+    if goodput_slos:
+        _print_goodput_metrics(goodput_slos=goodput_slos, metrics=metrics)
     print("{s:{c}^{n}}".format(s="End-to-End Latency", n=50, c="-"))
     print(
         "{:<40} {:<10.2f}".format("Mean E2E Latency (ms):", metrics.mean_e2e_latency_ms)
@@ -1894,6 +2008,10 @@ async def benchmark(
             "max_concurrent_requests": metrics.max_concurrent_requests,
         }
 
+        result.update(
+            _goodput_result_fields(goodput_slos=goodput_slos, metrics=metrics)
+        )
+
         if args.cache_report:
             result["cache_report"] = {
                 "total_prompt_tokens": total_prompt_tokens,
@@ -1984,6 +2102,10 @@ def run_benchmark(args_: argparse.Namespace):
 
     if not hasattr(args, "tokenize_prompt"):
         args.tokenize_prompt = False
+
+    if not hasattr(args, "goodput"):
+        args.goodput = None
+    goodput_slos = parse_goodput_slos(args.goodput)
 
     if not hasattr(args, "plot_throughput"):
         args.plot_throughput = False
@@ -2202,6 +2324,7 @@ def run_benchmark(args_: argparse.Namespace):
             mooncake_num_rounds=args.mooncake_num_rounds,
             profile_prefill_url=getattr(args, "profile_prefill_url", None),
             profile_decode_url=getattr(args, "profile_decode_url", None),
+            goodput_slos=goodput_slos,
         )
     )
 
@@ -2446,6 +2569,17 @@ def cli_main():
     parser.add_argument("--output-file", type=str, help="Output JSONL file name.")
     parser.add_argument(
         "--output-details", action="store_true", help="Output details of benchmarking."
+    )
+    parser.add_argument(
+        "--goodput",
+        nargs="+",
+        default=None,
+        metavar="KEY:VALUE",
+        help="Service level objectives for goodput, as KEY:VALUE pairs in "
+        f"milliseconds. KEY is one of {', '.join(GOODPUT_SLO_METRICS)} (time to "
+        "first token, time per output token, end-to-end latency). A request counts "
+        "toward goodput only if it succeeds and meets every given SLO, e.g. "
+        "--goodput ttft:500 tpot:50. Reports request goodput and SLO attainment.",
     )
     parser.add_argument(
         "--print-requests",
