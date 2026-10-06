@@ -3393,15 +3393,22 @@ class Scheduler(
         aborts: List[AbortReq] = []
 
         global_timeout_s = envs.SGLANG_REQ_WAITING_TIMEOUT.get()
-        if global_timeout_s > 0 or self._has_req_waiting_timeout:
+        has_req_timeout = self._has_req_waiting_timeout
+        if global_timeout_s > 0 or has_req_timeout:
             now = time.perf_counter()
+            # A request is dropped once it has outstayed either bound. A stamped
+            # entry time is > 0, so a deadline of 0 turns the global bound off.
+            global_deadline = now - global_timeout_s if global_timeout_s > 0 else 0
             for req in self.waiting_queue:
-                timeout_s = req.waiting_timeout
-                # The global bound caps the request's own; <= 0 means it is off.
-                if timeout_s is None or 0 < global_timeout_s < timeout_s:
-                    timeout_s = global_timeout_s
                 entry_time = req.time_stats.wait_queue_entry_time
-                if timeout_s > 0 and 0 < entry_time < now - timeout_s:
+                if 0 < entry_time and (
+                    entry_time < global_deadline
+                    or (
+                        has_req_timeout
+                        and req.waiting_timeout is not None
+                        and entry_time < now - req.waiting_timeout
+                    )
+                ):
                     aborts.append(
                         AbortReq(
                             rid=req.rid,
