@@ -35,8 +35,16 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class _FakeReq:
-    def __init__(self, rid, wait_entry=0.0, forward_entry=0.0, is_finished=False):
+    def __init__(
+        self,
+        rid,
+        wait_entry=0.0,
+        forward_entry=0.0,
+        is_finished=False,
+        waiting_timeout=None,
+    ):
         self.rid = rid
+        self.waiting_timeout = waiting_timeout
         self.cache_request_handle = CacheRequestHandle(rid, 0)
         self.to_finish = None
         self.beam_group = None
@@ -54,9 +62,14 @@ class _FakeReq:
 
 
 def _req(
-    rid: str, *, wait_entry: float = 0.0, forward_entry: float = 0.0, finished=False
+    rid: str,
+    *,
+    wait_entry: float = 0.0,
+    forward_entry: float = 0.0,
+    finished=False,
+    waiting_timeout=None,
 ):
-    return _FakeReq(rid, wait_entry, forward_entry, finished)
+    return _FakeReq(rid, wait_entry, forward_entry, finished, waiting_timeout)
 
 
 def _batch(reqs):
@@ -68,6 +81,7 @@ def _scheduler(waiting_queue, running_reqs=(), last_batch_reqs=()):
     s.enable_continuous_input_polling = False
     s.result_queue = deque()
     s.waiting_queue = waiting_queue
+    s._has_req_waiting_timeout = False
     s.enable_hierarchical_cache = False
     s.enable_hicache_storage = False
     s.enable_unified_cache_external_linker = False
@@ -133,6 +147,79 @@ class TestWaitingTimeout(CustomTestCase):
         s = _scheduler([_req("stale", wait_entry=time.perf_counter() - 100)])
         with envs.SGLANG_REQ_WAITING_TIMEOUT.override(0):
             self.assertEqual(s._poll_timeout_aborts(), [])
+
+    def test_effective_bound_is_the_smaller_of_request_and_global(self):
+        # (request bound, global bound, aborted) for a request that waited 10 s.
+        # A global value <= 0 is "off", so it must not win a plain min().
+        cases = [
+            (1.0, 100.0, True),
+            (100.0, 1.0, True),
+            (100.0, 1000.0, False),
+            (1.0, -1, True),
+            (100.0, -1, False),
+            (None, -1, False),
+        ]
+        for req_timeout, global_timeout, aborted in cases:
+            with self.subTest(request=req_timeout, global_timeout=global_timeout):
+                req = _req(
+                    "r",
+                    wait_entry=time.perf_counter() - 10,
+                    waiting_timeout=req_timeout,
+                )
+                s = _scheduler([req])
+                s._has_req_waiting_timeout = True
+                with envs.SGLANG_REQ_WAITING_TIMEOUT.override(global_timeout):
+                    aborts = s._poll_timeout_aborts()
+                self.assertEqual([a.rid for a in aborts], ["r"] if aborted else [])
+
+    def test_queue_is_not_walked_until_a_request_carries_a_bound(self):
+        class _NoWalk(list):
+            def __iter__(self):
+                raise AssertionError("the waiting queue was walked")
+
+        s = _scheduler(_NoWalk([_req("r", wait_entry=time.perf_counter() - 10)]))
+        with envs.SGLANG_REQ_WAITING_TIMEOUT.override(-1):
+            self.assertEqual(s._poll_timeout_aborts(), [])
+
+    def test_generate_request_carries_its_bound_and_arms_the_scan(self):
+        for waiting_timeout, armed in ((1.5, True), (None, False)):
+            with self.subTest(waiting_timeout=waiting_timeout):
+                s = Scheduler.__new__(Scheduler)
+                s.enable_session_radix_cache = False
+                s.model_config = SimpleNamespace(hf_eos_token_id={1}, vocab_size=128)
+                s.disaggregation_mode = DisaggregationMode.NULL
+                s.metrics_reporter = SimpleNamespace(enable_metrics=False)
+                s.tokenizer = None
+                s.dllm_config = None
+                s._maybe_namespace_elastic_radix_cache = MagicMock()
+                s.init_req_max_new_tokens = MagicMock()
+                s._add_request_to_queue = MagicMock()
+                s._has_req_waiting_timeout = False
+                recv_req = MagicMock(
+                    session_params=None,
+                    session_id=None,
+                    input_embeds=None,
+                    bootstrap_port=1,
+                    waiting_timeout=waiting_timeout,
+                )
+                with (
+                    patch(
+                        "sglang.srt.managers.scheduler.BeamCoordinator.request_beam_width",
+                        return_value=1,
+                    ),
+                    patch(
+                        "sglang.srt.managers.scheduler.Req",
+                        side_effect=lambda *args, **kwargs: MagicMock(
+                            waiting_timeout=kwargs["waiting_timeout"]
+                        ),
+                    ) as req_cls,
+                ):
+                    # The error argument only ends the call right after intake.
+                    s.handle_generate_request(recv_req, mm_input_error="stop here")
+                self.assertEqual(
+                    req_cls.call_args.kwargs["waiting_timeout"], waiting_timeout
+                )
+                self.assertIs(s._has_req_waiting_timeout, armed)
 
 
 class TestRunningTimeout(CustomTestCase):

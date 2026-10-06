@@ -1299,6 +1299,8 @@ class Scheduler(
         self.forward_sleep_time = None
         self._engine_paused = False
         self._deferred_input_requests: List = []
+        # Sticky; servers that never see waiting_timeout skip the per-step queue walk.
+        self._has_req_waiting_timeout = False
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = get_schedule().chunked_prefill_size
@@ -2810,6 +2812,7 @@ class Scheduler(
                 kv_hints=recv_req.kv_hints,
                 vocab_size=self.model_config.vocab_size,
                 priority=recv_req.priority,
+                waiting_timeout=recv_req.waiting_timeout,
                 metrics_collector=(
                     self.metrics_collector
                     if self.metrics_reporter.enable_metrics
@@ -2825,6 +2828,8 @@ class Scheduler(
                 token_indices_to_pool=recv_req.token_indices_to_pool,
             )
             req.tokenizer = self.tokenizer
+            if req.waiting_timeout is not None:
+                self._has_req_waiting_timeout = True
 
             if radix_native_session:
                 req.session_generation = self.tree_cache.ensure_session_generation(
@@ -3387,11 +3392,16 @@ class Scheduler(
         """
         aborts: List[AbortReq] = []
 
-        if (timeout_s := envs.SGLANG_REQ_WAITING_TIMEOUT.get()) > 0:
-            deadline = time.perf_counter() - timeout_s
+        global_timeout_s = envs.SGLANG_REQ_WAITING_TIMEOUT.get()
+        if global_timeout_s > 0 or self._has_req_waiting_timeout:
+            now = time.perf_counter()
             for req in self.waiting_queue:
+                timeout_s = req.waiting_timeout
+                # The global bound caps the request's own; <= 0 means it is off.
+                if timeout_s is None or 0 < global_timeout_s < timeout_s:
+                    timeout_s = global_timeout_s
                 entry_time = req.time_stats.wait_queue_entry_time
-                if 0 < entry_time < deadline:
+                if timeout_s > 0 and 0 < entry_time < now - timeout_s:
                     aborts.append(
                         AbortReq(
                             rid=req.rid,

@@ -136,6 +136,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             extra_key=request.extra_key,
             cache_salt=request.cache_salt,
             priority=request.priority,
+            waiting_timeout=request.waiting_timeout,
             routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,

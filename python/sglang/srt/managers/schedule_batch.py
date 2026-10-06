@@ -1054,6 +1054,7 @@ class Req(ReqDllmMixin):
         token_indices_to_pool: Optional[List[int]] = None,
         session_id: Optional[str] = None,
         cache_salt: Optional[str] = None,
+        waiting_timeout: Optional[float] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -1154,6 +1155,8 @@ class Req(ReqDllmMixin):
         self.eos_token_ids = eos_token_ids
         self.vocab_size = vocab_size
         self.priority = priority
+        # Seconds. Wall-clock comparisons against it must stay on the leader rank.
+        self.waiting_timeout = waiting_timeout
 
         # For incremental decoding
         # ----- | --------- read_ids -------|

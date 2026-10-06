@@ -1114,6 +1114,32 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertTrue(req[0].return_prompt_token_ids)
         self.assertTrue(req[1].return_prompt_token_ids)
 
+    def test_getitem_preserves_waiting_timeout(self):
+        req = GenerateReqInput(
+            input_ids=[[1, 2, 3], [4, 5, 6]],
+            sampling_params=[{}, {}],
+            rid=["id1", "id2"],
+            waiting_timeout=1.5,
+        )
+        req.normalize_batch_and_arguments()
+
+        self.assertEqual(req[0].waiting_timeout, 1.5)
+        self.assertEqual(req[1].waiting_timeout, 1.5)
+
+    def test_waiting_timeout_must_be_positive_and_finite(self):
+        # 10**400 is an int no float can hold; the scheduler subtracts the bound
+        # from a float clock, so it has to be refused here.
+        for bad in (0, -1.0, float("inf"), float("nan"), "2", 10**400):
+            with self.subTest(waiting_timeout=bad):
+                req = GenerateReqInput(input_ids=[1, 2, 3], waiting_timeout=bad)
+                with self.assertRaisesRegex(ValueError, "waiting_timeout"):
+                    req.normalize_batch_and_arguments()
+
+        req = GenerateReqInput(input_ids=[1, 2, 3], waiting_timeout=3)
+        req.normalize_batch_and_arguments()
+        self.assertIsInstance(req.waiting_timeout, float)
+        self.assertEqual(req.waiting_timeout, 3.0)
+
     def test_regenerate_rid(self):
         """Test the regenerate_rid method."""
         req = GenerateReqInput(text="Hello")

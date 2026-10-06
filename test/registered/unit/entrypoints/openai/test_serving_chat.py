@@ -737,6 +737,22 @@ class ServingChatTestCase(CustomTestCase):
         self.assertEqual(request.model_dump(), body)
         self.assertFalse(hasattr(request, "conversation_id"))
 
+    def test_waiting_timeout_reaches_internal_request(self):
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            waiting_timeout=1.5,
+        )
+        processed_messages = MessageProcessingResult(
+            "Test prompt", [1, 2, 3], None, None, [], [], None
+        )
+        with patch.object(
+            self.chat, "_process_messages", return_value=processed_messages
+        ):
+            adapted, _ = self.chat._convert_to_internal_request(request)
+
+        self.assertEqual(adapted.waiting_timeout, 1.5)
+
     def test_convert_to_internal_request_rejects_stream_token_ids(self):
         for field in ("return_prompt_token_ids", "return_token_ids"):
             req = ChatCompletionRequest(

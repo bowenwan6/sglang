@@ -412,6 +412,8 @@ class CompletionRequest(PDRoutingFields):
     cache_salt: Optional[Union[List[str], str]] = None
     # Priority for the request
     priority: Optional[int] = None
+    # Seconds the request may wait in the scheduler queue before a 503 abort.
+    waiting_timeout: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
 
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
@@ -972,6 +974,8 @@ class ChatCompletionRequest(PDRoutingFields):
     cache_salt: Optional[Union[List[str], str]] = None
     # Priority for the request
     priority: Optional[int] = None
+    # Seconds the request may wait in the scheduler queue before a 503 abort.
+    waiting_timeout: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
 
     # Deprecated: use routed_dp_rank instead
     data_parallel_rank: Optional[int] = None
