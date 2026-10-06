@@ -107,6 +107,13 @@ class ServingCompletionTestCase(unittest.TestCase):
         self.assertEqual(internal.cache_salt, "tenant-a")
         self.assertEqual(internal.extra_key, "classification")
 
+    def test_waiting_timeout_reaches_internal_request(self):
+        req = CompletionRequest(
+            model="x", prompt=[1, 2, 3, 4], max_tokens=1, waiting_timeout=1.5
+        )
+        internal, _ = self.sc._convert_to_internal_request(req)
+        self.assertEqual(internal.waiting_timeout, 1.5)
+
     def test_single_request_rejects_batched_cache_salt(self):
         req = CompletionRequest(
             model="x",

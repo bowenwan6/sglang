@@ -25,6 +25,7 @@ from __future__ import annotations
 import copy
 import logging
 import pickle
+import sys
 import uuid
 from array import array
 from collections import Counter
@@ -375,6 +376,10 @@ class GenerateReqInput:
         Union[List[Optional[Union[Dict, KvHintsEnvelope]]], Dict, KvHintsEnvelope]
     ] = None
 
+    # Seconds the request may stay in the waiting queue before a 503 abort;
+    # SGLANG_REQ_WAITING_TIMEOUT still caps it. None means no bound of its own.
+    waiting_timeout: Optional[float] = None
+
     def regenerate_rid(self):
         """Generate a new request ID and return it."""
         if isinstance(self.rid, list):
@@ -465,6 +470,16 @@ class GenerateReqInput:
             raise ValueError(
                 "return_flat_raw_top_logprobs_b64 requires return_flat_raw_top_logprobs."
             )
+        if self.waiting_timeout is not None:
+            # An int above the largest float would overflow the scheduler's clock math.
+            if not (
+                isinstance(self.waiting_timeout, (int, float))
+                and 0 < self.waiting_timeout <= sys.float_info.max
+            ):
+                raise ValueError(
+                    "waiting_timeout should be a positive, finite number of seconds."
+                )
+            self.waiting_timeout = float(self.waiting_timeout)
 
     def _determine_batch_size(self):
         """Determine if this is a single example or a batch and the batch size."""
@@ -1016,6 +1031,7 @@ class GenerateReqInput:
             extra_key=self.extra_key[i] if self.extra_key is not None else None,
             cache_salt=(self.cache_salt[i] if self.cache_salt is not None else None),
             kv_hints=(self.kv_hints[i] if self.kv_hints is not None else None),
+            waiting_timeout=self.waiting_timeout,
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
@@ -1151,6 +1167,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Shape of output_token_sampling_logprobs for each output token. This is a
     # defaulted tail field so older IPC senders decode as selected mode.
     sampling_logprobs_mode: SamplingLogprobsMode = "selected"
+    # See GenerateReqInput.waiting_timeout. Appended as a defaulted tail field,
+    # so the Rust server's shorter arrays decode it as None.
+    waiting_timeout: Optional[float] = None
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
